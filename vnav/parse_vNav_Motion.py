@@ -5,18 +5,52 @@ import itertools
 import glob
 import argparse
 import json
+import sys
 
 def normalize(x):
   return x / np.sqrt(np.dot(x,x))
 
-def readRotAndTrans(paths):
+def readAndThrowUsefulError(filename):
+  try:
+    return pydicom.dcmread(filename)
+  except Exception as e:
+    raise (ValueError(filename + " was not a DICOM file.\n" + str(e)), None, sys.exc_info()[2])
+
+
+def convertSplitCommentToRotAndTrans(y):
+  if y is None:
+    return None
+
+  try:
+    return (np.array(list(map(float, y[1:5]))), list(map(float, y[6:9])))
+  except ValueError as e:
+    return None 
+
+
+def splitImageComments(dicomData):
+  if 'ImageComments' in dicomData:
+    return dicomData.ImageComments.split()
+
+  return None
+
+
+def readRotAndTrans(paths, failOnIncomplete):
   files = list(itertools.chain.from_iterable([glob.glob(path) for path in paths]))
 
-  head = [(np.array([1,0,0,0]),np.array([0,0,0]))]
-  ds = sorted([pydicom.dcmread(x) for x in files], key=lambda dcm: dcm.AcquisitionNumber)
-  imageComments = [ str.split(x.ImageComments) for x in ds[1:] if 'ImageComments' in x ]
+  if len(files) < 2:
+      raise ValueError("Less than needed minimum of two files matched input: " + "\n".join(paths))
 
-  return list(itertools.chain.from_iterable([head, [ (np.array(list(map(float, y[1:5]))), list(map(float, y[6:9]))) for y in imageComments] ]))
+  head = [(np.array([1,0,0,0]),np.array([0,0,0]))]
+  ds = sorted([readAndThrowUsefulError(x) for x in files], key=lambda dcm: dcm.AcquisitionNumber)
+  imageComments = [ splitImageComments(x) for x in ds[1:] ]
+
+  retList = list(itertools.chain.from_iterable([head, [ convertSplitCommentToRotAndTrans(y) for y in imageComments] ]))
+
+  # short-circuit if we're supposed to fail on incomplete data (e.g., when someone moved more than we could track)
+  if failOnIncomplete and None in retList:
+    return None;
+
+  return retList 
 
 def angleAxisToQuaternion(a):
   w = np.cos(a[0] / 2.0)
@@ -151,9 +185,18 @@ def diffTransformToRMSMotion(t, radius):
     np.dot(trans, trans)
     )
 
-def parseMotion(rotAndTrans, tr, radius):
+def parseMotion(rotAndTrans, tr, radius, infiniteMeanOnIncomplete):
+    if rotAndTrans is None:
+        return None
+
+    rotAndTransTruncated = rotAndTrans
+
+    # drop all trailing Nones (i.e., image comments that didn't match our format)
+    while rotAndTransTruncated[-1] is None:
+        rotAndTransTruncated.pop()
+
     # Transform creation and differences
-    transforms = [motionEntryToHomogeneousTransform(e) for e in rotAndTrans]
+    transforms = [motionEntryToHomogeneousTransform(e) for e in rotAndTransTruncated]
     diffTransforms = [ts[1] * np.linalg.inv(ts[0]) for ts in zip(transforms[0:], transforms[1:])]
 
     # Motion scores
@@ -161,10 +204,17 @@ def parseMotion(rotAndTrans, tr, radius):
     maxMotionScores = [diffTransformToMaxMotion(t, radius) for t in diffTransforms]
 
     scores = {}
-    scores['mean_rms'] = np.mean(rmsMotionScores) * 60.0 / tr
-    scores['mean_max'] = np.mean(maxMotionScores) * 60.0 / tr
     scores['rms_scores'] = rmsMotionScores
     scores['max_scores'] = maxMotionScores
+
+    if infiniteMeanOnIncomplete and None in rotAndTrans:
+      scores['mean_rms'] = np.Infinity 
+      scores['mean_max'] = np.Infinity
+    elif len(rmsMotionScores) is 0 or len(maxMotionScores) is 0:
+      raise ValueError("Motion list length is 0")
+    else:
+      scores['mean_rms'] = np.mean(rmsMotionScores) * 60.0 / tr
+      scores['mean_max'] = np.mean(maxMotionScores) * 60.0 / tr
 
     return scores
 
@@ -178,6 +228,8 @@ if __name__ == '__main__':
                       help='A list of DICOM files that make up the vNav series (in chronological order)')
   parser.add_argument('--radius', required=True, type=float,
                       help='Assumed brain radius in millimeters for estimating rotation distance.')
+  parser.add_argument('--fail-on-incomplete', action='store_true', help='Return error on incomplete data.')
+  parser.add_argument('--infinite-mean-on-incomplete', action='store_true', help='Return infinite mean values on incomplete data.')
   output_type = parser.add_mutually_exclusive_group(required=True)
   output_type.add_argument('--mean-rms', action='store_true', help='Print time-averaged root mean square (RMS) motion.')
   output_type.add_argument('--mean-max', action='store_true', help='Print time-averaged max motion.')
@@ -185,11 +237,16 @@ if __name__ == '__main__':
   output_type.add_argument('--max-scores', action='store_true', help='Print max motion over time.')
 
   args = parser.parse_args()
-  
-  scores = parseMotion(readRotAndTrans(args.input), args.tr, args.radius)
+ 
+  try:
+    scores = parseMotion(readRotAndTrans(args.input, args.fail_on_incomplete), args.tr, args.radius, args.infinite_mean_on_incomplete)
+  except Exception as e:
+      raise (ValueError("Error while processing " + args.input[0] + ":\n" + str(e)), None, sys.exc_info()[2])
 
   # Script output to STDOUT depending on "output_type"
-  if args.mean_rms:
+  if scores is None:
+    print "Tracking failed"
+  elif args.mean_rms:
     print(scores['mean_rms'])
   elif args.mean_max:
     print(scores['mean_max'])
